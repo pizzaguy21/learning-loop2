@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Light theme only for now; dark mode is not designed yet. */
+:root {
+  color-scheme: light;
+}
+
+body {
+  background: #fafaf9;
+  color: #1c1917;
+  font-family: var(--font-sans);
+}

@@ -1,0 +1,6 @@
+{
+  "projects": {
+    "default": "demo-learning-loop",
+    "prod": "open-space-936ea"
+  }
+}

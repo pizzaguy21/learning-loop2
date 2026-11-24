@@ -1,0 +1,197 @@
+rules_version = '2';
+
+// Learning Loop security rules.
+//
+// Anonymity model: a question document never stores who asked it. The asker's
+// identity lives in courses/{cid}/questionAuthors/{qid}, which only the asker
+// and the course lecturer can read. Classmates therefore cannot recover the
+// asker even through the browser devtools, while the lecturer can.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function coursePath(cid) {
+      return /databases/$(database)/documents/courses/$(cid);
+    }
+
+    function memberPath(cid) {
+      return /databases/$(database)/documents/courses/$(cid)/members/$(request.auth.uid);
+    }
+
+    function isMember(cid) {
+      return signedIn() && exists(memberPath(cid));
+    }
+
+    function member(cid) {
+      return get(memberPath(cid)).data;
+    }
+
+    function isLecturer(cid) {
+      return isMember(cid) && member(cid).role == 'lecturer';
+    }
+
+    function displayName() {
+      return request.auth.token.get('name', request.auth.token.email);
+    }
+
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    function exactKeys(keys) {
+      return request.resource.data.keys().hasAll(keys)
+        && request.resource.data.keys().hasOnly(keys);
+    }
+
+    function textOk(value, minLen, maxLen) {
+      return value is string && value.size() >= minLen && value.size() <= maxLen;
+    }
+
+    // Join codes map a short code to a course (and its name, which a
+    // student needs before they are allowed to read the course itself). They can be fetched one at a
+    // time by code but never listed, so codes cannot be enumerated.
+    match /joinCodes/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn()
+        && exactKeys(['courseId', 'courseName'])
+        && request.resource.data.courseName == getAfter(coursePath(request.resource.data.courseId)).data.name
+        && getAfter(coursePath(request.resource.data.courseId)).data.lecturerUid == request.auth.uid
+        && getAfter(coursePath(request.resource.data.courseId)).data.code == code;
+      allow update, delete: if false;
+    }
+
+    match /courses/{cid} {
+      allow read: if isMember(cid);
+      allow create: if signedIn()
+        && exactKeys(['name', 'code', 'topics', 'lecturerUid', 'lecturerName', 'createdAt'])
+        && textOk(request.resource.data.name, 3, 100)
+        && request.resource.data.code is string && request.resource.data.code.size() == 6
+        && request.resource.data.topics is list && request.resource.data.topics.size() <= 30
+        && request.resource.data.lecturerUid == request.auth.uid
+        && request.resource.data.lecturerName == displayName()
+        && request.resource.data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/joinCodes/$(request.resource.data.code)).data.courseId == cid;
+      // The name is fixed because join codes and memberships copy it.
+      allow update: if isLecturer(cid)
+        && changed().hasOnly(['topics'])
+        && request.resource.data.topics is list && request.resource.data.topics.size() <= 30;
+      allow delete: if false;
+
+      match /members/{uid} {
+        allow get: if signedIn() && (request.auth.uid == uid || isLecturer(cid));
+        allow list: if isLecturer(cid);
+        allow create: if signedIn()
+          && request.auth.uid == uid
+          && exactKeys(['uid', 'courseId', 'name', 'email', 'role', 'courseName', 'joinCode', 'joinedAt'])
+          && request.resource.data.uid == uid
+          && request.resource.data.courseId == cid
+          && request.resource.data.name == displayName()
+          && request.resource.data.email == request.auth.token.email
+          && request.resource.data.courseName == getAfter(coursePath(cid)).data.name
+          && request.resource.data.joinCode == getAfter(coursePath(cid)).data.code
+          && request.resource.data.joinedAt == request.time
+          && (
+            request.resource.data.role == 'student'
+            || (request.resource.data.role == 'lecturer'
+                && getAfter(coursePath(cid)).data.lecturerUid == uid)
+          );
+        // The lecturer can promote a student to peer mentor and back.
+        allow update: if isLecturer(cid)
+          && uid != request.auth.uid
+          && changed().hasOnly(['role'])
+          && resource.data.role in ['student', 'mentor']
+          && request.resource.data.role in ['student', 'mentor'];
+        allow delete: if false;
+      }
+
+      match /questions/{qid} {
+        allow read: if isMember(cid);
+        allow create: if isMember(cid)
+          && exactKeys(['title', 'body', 'topic', 'status', 'answerCount',
+                        'verifiedAnswerId', 'createdAt', 'lastActivityAt'])
+          && textOk(request.resource.data.title, 5, 150)
+          && textOk(request.resource.data.body, 0, 3000)
+          && textOk(request.resource.data.topic, 1, 60)
+          && request.resource.data.status == 'open'
+          && request.resource.data.answerCount == 0
+          && request.resource.data.verifiedAnswerId == null
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.lastActivityAt == request.time
+          && existsAfter(/databases/$(database)/documents/courses/$(cid)/questionAuthors/$(qid));
+        allow update: if isMember(cid)
+          && request.resource.data.lastActivityAt == request.time
+          && (
+            // Any member posting an answer bumps the counter by one.
+            (changed().hasOnly(['answerCount', 'status', 'lastActivityAt'])
+              && request.resource.data.answerCount == resource.data.answerCount + 1
+              && (request.resource.data.status == resource.data.status
+                  || (resource.data.status == 'open' && request.resource.data.status == 'answered')))
+            ||
+            // The lecturer marks one answer as verified.
+            (isLecturer(cid)
+              && changed().hasOnly(['answerCount', 'status', 'verifiedAnswerId', 'lastActivityAt'])
+              && request.resource.data.status == 'verified'
+              && request.resource.data.verifiedAnswerId is string
+              && getAfter(/databases/$(database)/documents/courses/$(cid)/questions/$(qid)/answers/$(request.resource.data.verifiedAnswerId)).data.verified == true
+              && request.resource.data.answerCount in [resource.data.answerCount, resource.data.answerCount + 1])
+          );
+        allow delete: if false;
+
+        match /answers/{aid} {
+          allow read: if isMember(cid);
+          allow create: if isMember(cid)
+            && exactKeys(['body', 'authorUid', 'authorName', 'authorRole', 'official',
+                          'verified', 'verifiedAt', 'createdAt'])
+            && textOk(request.resource.data.body, 1, 3000)
+            && request.resource.data.authorUid == request.auth.uid
+            && request.resource.data.authorName == member(cid).name
+            && request.resource.data.authorRole == member(cid).role
+            && request.resource.data.createdAt == request.time
+            && getAfter(/databases/$(database)/documents/courses/$(cid)/questions/$(qid)).data.answerCount
+               == get(/databases/$(database)/documents/courses/$(cid)/questions/$(qid)).data.answerCount + 1
+            && (
+              (request.resource.data.official == false
+                && request.resource.data.verified == false
+                && request.resource.data.verifiedAt == null)
+              ||
+              // A lecturer's own answer is official and verified at once.
+              (isLecturer(cid)
+                && request.resource.data.official == true
+                && request.resource.data.verified == true
+                && request.resource.data.verifiedAt == request.time
+                && getAfter(/databases/$(database)/documents/courses/$(cid)/questions/$(qid)).data.verifiedAnswerId == aid)
+            );
+          allow update: if isLecturer(cid)
+            && changed().hasOnly(['verified', 'verifiedAt'])
+            && request.resource.data.verified is bool;
+          allow delete: if false;
+        }
+      }
+
+      match /questionAuthors/{qid} {
+        allow read: if signedIn()
+          && (resource.data.uid == request.auth.uid || isLecturer(cid));
+        // Only together with a brand-new question, so nobody can claim an
+        // existing question as their own.
+        allow create: if isMember(cid)
+          && exactKeys(['uid', 'name', 'email', 'createdAt'])
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.name == member(cid).name
+          && request.resource.data.email == request.auth.token.email
+          && request.resource.data.createdAt == request.time
+          && !exists(/databases/$(database)/documents/courses/$(cid)/questions/$(qid))
+          && existsAfter(/databases/$(database)/documents/courses/$(cid)/questions/$(qid));
+        allow update, delete: if false;
+      }
+    }
+
+    // "My classes": a user can find their own memberships across courses.
+    match /{path=**}/members/{uid} {
+      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+  }
+}
